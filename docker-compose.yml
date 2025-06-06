@@ -1,0 +1,245 @@
+name: qingling-copilot
+services:
+  network-service:
+    image: alpine:3.21.3
+    container_name: qingling-network
+    restart: always
+    ports:
+      - '${MINIO_PORT}:${MINIO_PORT}' # MinIO API
+      - '9001:9001' # MinIO Console
+      - '${CASDOOR_PORT}:${CASDOOR_PORT}' # Casdoor
+      # - "11434:11434" # ollama
+      # - '${NW_WEB_PORT}:${NW_WEB_PORT}' # LobeChat
+      # - '${LOBE_PORT}:${LOBE_PORT}' # LobeChat
+      - '${NGX_HTTP_PORT}:80' # nginx
+    command: tail -f /dev/null
+    networks:
+      - qingling-network
+    # profiles:
+    #   - chat
+
+  nginx:
+    image: nginx:1.28-alpine
+    container_name: qingling-nginx
+    network_mode: 'service:network-service'
+    volumes:
+      - './nginx_conf:/etc/nginx/templates'
+    env_file:
+      - .env
+    restart: always
+    depends_on:
+      - netconf
+
+  netconf:
+    image: qingling/network-conf:v1.8
+    pull_policy: never
+    container_name: qingling-netconf
+    network_mode: 'service:network-service'
+    # networks:
+    #   - qingling-network
+    # ports:
+    #   - 3080:80
+    env_file:
+      - .env
+    environment:
+      - PORT=${NW_WEB_PORT}
+    #   - 'NW_API_PORT=${NW_API_PORT}'
+    restart: always
+
+  postgresql:
+    image: pgvector/pgvector:pg17
+    container_name: qingling-postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - './data:/var/lib/postgresql/data'
+    environment:
+      - 'POSTGRES_DB=${POSTGRES_DB}'
+      - 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD}'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - qingling-network
+
+  # ollama:
+  #   image: ollama/ollama
+  #   pull_policy: never
+  #   container_name: qingling-ollama
+  #   ports:
+  #     - '21434:11434'
+  #   volumes:
+  #     - './ollama_data:/root/.ollama'
+  #   environment:
+  #     - 'OLLAMA_KEEP_ALIVE=-1'
+  #     - 'OLLAMA_ORIGINS=*'
+  #     - 'OLLAMA_CONTEXT_LENGTH=8192'
+  #   # healthcheck:
+  #   #   test: ['CMD-SHELL', 'pg_isready -U postgres']
+  #   #   interval: 5s
+  #   #   timeout: 5s
+  #   #   retries: 5
+  #   restart: always
+  #   networks:
+  #     - qingling-network
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-08T15-41-24Z
+    container_name: qingling-minio
+    network_mode: 'service:network-service'
+    volumes:
+      - './s3_data:/etc/minio/data'
+    environment:
+      - 'MINIO_API_CORS_ALLOW_ORIGIN=*'
+    env_file:
+      - .env
+    restart: always
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:${MINIO_PORT}/minio/health/live"]
+    #   interval: 30s
+    #   timeout: 20s
+    #   retries: 3
+    entrypoint: >
+      /bin/sh -c "
+        minio server /etc/minio/data --address ':${MINIO_PORT}' --console-address ':9001' &
+        MINIO_PID=\$!
+        while ! curl -s http://localhost:${MINIO_PORT}/minio/health/live; do
+          echo 'Waiting for MinIO to start...'
+          sleep 1
+        done
+        sleep 5
+        mc alias set myminio http://localhost:${MINIO_PORT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
+        echo 'Creating bucket ${MINIO_LOBE_BUCKET}'
+        mc mb myminio/${MINIO_LOBE_BUCKET}
+        wait \$MINIO_PID
+      "
+
+# version lock ref: https://github.com/lobehub/lobe-chat/pull/7331
+  casdoor:
+    image: casbin/casdoor:v1.843.0
+    container_name: qingling-casdoor
+    entrypoint: /bin/sh -c './server --createDatabase=true'
+    network_mode: 'service:network-service'
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      httpport: ${CASDOOR_PORT}
+      RUNNING_IN_DOCKER: 'true'
+      driverName: 'postgres'
+      dataSourceName: 'user=postgres password=${POSTGRES_PASSWORD} host=postgresql port=5432 sslmode=disable dbname=casdoor'
+      runmode: 'dev'
+    restart: always
+    volumes:
+      - './init_data.json:/init_data.json'
+      - './casdoor_files:/files'
+      - './icons:/web/build/icons'
+    env_file:
+      - .env
+
+  searxng:
+    image: searxng/searxng:2025.4.12-391bb1268
+    container_name: qingling-searxng
+    volumes:
+      - './searxng-settings.yml:/etc/searxng/settings.yml'
+    environment:
+      - 'SEARXNG_SETTINGS_FILE=/etc/searxng/settings.yml'
+    restart: always
+    networks:
+      - qingling-network
+    env_file:
+      - .env
+    # profiles:
+    #   - chat
+
+  chat:
+    image: qingling/copilot-chat:v1.8
+    pull_policy: never
+    container_name: qingling-chat
+    network_mode: 'service:network-service'
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      network-service:
+        condition: service_started
+      minio:
+        condition: service_started
+      casdoor:
+        condition: service_started
+      # ollama:
+      #   condition: service_started
+    environment:
+      - 'PORT=${LOBE_PORT}'
+      - 'NEXT_AUTH_SSO_PROVIDERS=casdoor'
+      # - 'KEY_VAULTS_SECRET=${KEY_VAULTS_SECRET}'
+      # - 'NEXT_AUTH_SECRET=${NEXT_AUTH_SECRET}'
+      - 'DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgresql:5432/${LOBE_DB_NAME}'
+      - 'S3_BUCKET=${MINIO_LOBE_BUCKET}'
+      - 'S3_ENABLE_PATH_STYLE=1'
+      - 'S3_ACCESS_KEY=${MINIO_ROOT_USER}'
+      - 'S3_ACCESS_KEY_ID=${MINIO_ROOT_USER}'
+      - 'S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}'
+      - 'S3_SET_ACL=0'
+      - 'LLM_VISION_IMAGE_USE_BASE64=1'
+      - 'SEARXNG_URL=http://searxng:8080'
+      # supress warnings
+      - 'LOBE_PID=0'
+      - 'MINIO_PID=0'
+    env_file:
+      - .env
+    restart: always
+    # profiles:
+    #   - chat
+    entrypoint: >
+      /bin/sh -c "
+        /bin/node /app/startServer.js &
+        LOBE_PID=\$!
+        sleep 3
+        if [ $(wget --timeout=5 --spider --server-response ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration 2>&1 | grep -c 'HTTP/1.1 200 OK') -eq 0 ]; then
+          echo '⚠️Warining: Unable to fetch OIDC configuration from Casdoor'
+          echo 'Request URL: ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration'
+          echo 'Read more at: https://lobehub.com/docs/self-hosting/server-database/docker-compose#necessary-configuration'
+          echo ''
+          echo '⚠️注意：无法从 Casdoor 获取 OIDC 配置'
+          echo '请求 URL: ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration'
+          echo '了解更多：https://lobehub.com/zh/docs/self-hosting/server-database/docker-compose#necessary-configuration'
+          echo ''
+        else
+          if ! wget -O - --timeout=5 ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration 2>&1 | grep 'issuer' | grep ${AUTH_CASDOOR_ISSUER}; then
+            printf '❌Error: The Auth issuer is conflict, Issuer in OIDC configuration is: %s' \$(wget -O - --timeout=5 ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration 2>&1 | grep -E 'issuer.*' | awk -F '\"' '{print \$4}')
+            echo ' , but the issuer in .env file is: ${AUTH_CASDOOR_ISSUER} '
+            echo 'Request URL: ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration'
+            echo 'Read more at: https://lobehub.com/docs/self-hosting/server-database/docker-compose#necessary-configuration'
+            echo ''
+            printf '❌错误：Auth 的 issuer 冲突，OIDC 配置中的 issuer 是：%s' \$(wget -O - --timeout=5 ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration 2>&1 | grep -E 'issuer.*' | awk -F '\"' '{print \$4}')
+            echo ' , 但 .env 文件中的 issuer 是：${AUTH_CASDOOR_ISSUER} '
+            echo '请求 URL: ${AUTH_CASDOOR_ISSUER}/.well-known/openid-configuration'
+            echo '了解更多：https://lobehub.com/zh/docs/self-hosting/server-database/docker-compose#necessary-configuration'
+            echo ''
+          fi
+        fi
+        if [ $(wget --timeout=5 --spider --server-response ${S3_ENDPOINT}/minio/health/live 2>&1 | grep -c 'HTTP/1.1 200 OK') -eq 0 ]; then
+          echo '⚠️Warining: Unable to fetch MinIO health status'
+          echo 'Request URL: ${S3_ENDPOINT}/minio/health/live'
+          echo 'Read more at: https://lobehub.com/docs/self-hosting/server-database/docker-compose#necessary-configuration'
+          echo ''
+          echo '⚠️注意：无法获取 MinIO 健康状态'
+          echo '请求 URL: ${S3_ENDPOINT}/minio/health/live'
+          echo '了解更多：https://lobehub.com/zh/docs/self-hosting/server-database/docker-compose#necessary-configuration'
+          echo ''
+        fi
+        wait \$LOBE_PID
+      "
+
+# volumes:
+#   data:
+#     driver: local
+#   s3_data:
+#     driver: local
+
+networks:
+  qingling-network:
+    driver: bridge

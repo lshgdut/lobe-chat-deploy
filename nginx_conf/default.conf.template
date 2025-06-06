@@ -1,0 +1,158 @@
+# 定义上游服务（可以加多个 IP 做负载均衡）
+upstream chat_server {
+    server 127.0.0.1:${LOBE_PORT};
+}
+
+# casdoor 服务
+upstream casdoor_server {
+    server 127.0.0.1:${CASDOOR_PORT};
+}
+
+# S3/MinIO 服务
+upstream minio_server {
+    server 127.0.0.1:${MINIO_PORT};
+}
+
+upstream networkconf_web_server {
+    server 127.0.0.1:${NW_WEB_PORT};
+}
+
+upstream networkconf_api_server {
+    server host.docker.internal:${NW_API_PORT};
+}
+
+map $http_host $this_host {
+    "" $host;
+    default $http_host;
+}
+
+map $http_x_forwarded_proto $the_scheme {
+    default $http_x_forwarded_proto;
+    "" $scheme;
+}
+
+map $http_x_forwarded_host $the_host {
+    default $http_x_forwarded_host;
+    "" $this_host;
+}
+
+map $http_upgrade $proxy_connection {
+    default upgrade;
+    "" close;
+}
+
+# 定义变量，根据 referer 判断是否满足条件
+map $http_referer $from_casdoor {
+    default 0;
+    ~*/oidc 1;
+}
+
+server {
+    listen 80;
+
+    client_max_body_size 1g;
+
+    # location /oidc {
+    #     proxy_pass http://casdoor_server/;
+
+    #     # 常规 header 设置
+    #     proxy_set_header Host $http_host;
+    #     proxy_set_header X-Real-IP $remote_addr;
+    #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # }
+
+    # location /static {
+    #     # if ($from_casdoor = 1) {
+    #         proxy_pass http://casdoor_server/;
+    #         # 常规 header 设置
+    #         proxy_set_header Host $http_host;
+    #         proxy_set_header X-Real-IP $remote_addr;
+    #         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    #         break;
+    #     # }
+    #     # return 404;
+    # }
+
+    # location /.well-known {
+    #     proxy_pass http://casdoor_server/.well-known;
+    #     # 常规 header 设置
+    #     proxy_set_header Host $http_host;
+    #     proxy_set_header X-Real-IP $remote_addr;
+    #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # }
+
+    location /s3 {
+        proxy_pass http://minio_server;
+
+        # WebSocket 关键 header 设置
+        proxy_http_version 1.1;
+
+        # 常规 header 设置
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Host $the_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /networks/api/ {
+        proxy_pass http://networkconf_api_server/api/;
+
+        # WebSocket 关键 header 设置
+        proxy_http_version 1.1;
+
+        # 常规 header 设置
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Host $the_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # proxy_connect_timeout 1s;
+    }
+
+    location = /networks {
+        absolute_redirect off;
+        return 301 /networks/;
+    }
+    location /networks/ {
+        proxy_pass http://networkconf_web_server/;
+
+        # WebSocket 关键 header 设置
+        proxy_http_version 1.1;
+
+        # 常规 header 设置
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Host $the_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # 避免后端压缩干扰 sub_filter 替换
+        proxy_set_header Accept-Encoding "";
+        # 替换 HTML 中的资源引用路径
+        sub_filter_once off;
+        # 仅对 HTML 类型做替换
+        sub_filter_types text/html application/javascript;
+        sub_filter '/assets/' '/networks/assets/';
+        sub_filter 'path:"/hotspot' 'path:"/networks/hotspot';
+        sub_filter 'index:"/hotspot' 'index:"/networks/hotspot';
+        sub_filter 'path:"/network' 'path:"/networks/network';
+        sub_filter 'index:"/network' 'index:"/networks/network';
+        sub_filter 'redirect:"/network"' 'redirect:"/networks/network"';
+        # sub_filter_types text/javascript;
+        sub_filter '/api/v1' '/networks/api/v1';
+    }
+
+    location / {
+        proxy_pass http://chat_server;
+
+        proxy_connect_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 600s;
+
+        # WebSocket 关键 header 设置
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $proxy_connection;
+
+        # 常规 header 设置
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
