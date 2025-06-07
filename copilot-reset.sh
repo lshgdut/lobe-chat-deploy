@@ -206,21 +206,23 @@ section_init_database() {
 
 main() {
 
-    docker compose down
+    # 有初始化过才删除
+    test -f .env && docker compose down
 
-    rm -rvf casdoor_files data s3_data
+    rm -rvf casdoor_files postgres_data s3_data init_data.json .env
 
     # copy init_data.json template
     cp -f init_data.json.template init_data.json
 
-    test -f .env || cp env.template .env
+    cp env.template .env
 
     section_regenerate_secrets
     section_regenerate_redirect_uris
 
     docker compose up -d --remove-orphans
 
-    section_display_configurated_report
+    section_display_configurated_report | tee report.txt
+    echo {} > init_data.json
 
 }
 main
